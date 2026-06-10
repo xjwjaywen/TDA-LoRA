@@ -3,22 +3,12 @@ model:
   resolution: 512
 
 lora:
-  base_rank: 8
-  alpha: 16
+  base_rank: 16
   target_modules: ["to_q", "to_v", "to_k", "to_out.0"]
 
-tda:
-  # Timestep-aware rank scaling
-  timestep_bins: 3  # [high_noise, mid_noise, low_noise]
-  timestep_rank_scales: [0.5, 1.0, 1.5]  # high noise -> low rank, low noise -> high rank
-
-  # Domain-aware scaling
-  domain_gap_method: "clip"  # how to estimate domain gap
-  domain_scale_factor: 0.3  # how much domain gap affects rank: rank *= (1 - factor * gap)
-
-  # Layer-wise importance (gradient-guided)
-  warmup_steps: 50  # steps to collect gradient stats
-  layer_importance_top_k: 0.5  # top 50% layers get full rank, rest get reduced
+snr:
+  gamma: 5.0
+  domain_boost: 1.0
 
 training:
   num_steps: 800

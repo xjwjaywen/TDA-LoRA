@@ -1,10 +1,13 @@
 """
-TDA-LoRA: Timestep-Domain Adaptive Low-Rank Adaptation.
+AdaSNR-LoRA: Domain-Adaptive SNR Loss Reweighting for Few-Shot LoRA.
 
-Uses PEFT's standard LoRA as backbone, adds three adaptive components:
-  1. Timestep-aware loss weighting (sample fewer high-noise timesteps)
-  2. Domain-aware rank adjustment (CLIP-based gap -> per-layer rank)
-  3. Gradient-guided layer importance (warmup -> rank_pattern)
+Built on proven techniques:
+  1. Min-SNR loss weighting (ICCV 2023) - reweight loss per timestep
+  2. Domain-adaptive gamma - adjust SNR gamma based on domain gap
+  3. Gradient-guided layer rank - important layers get higher rank
+
+Novel contribution: domain-adaptive SNR reweighting where gamma is
+automatically determined by the target domain's characteristics.
 """
 import torch
 import torch.nn as nn
@@ -14,17 +17,16 @@ from typing import Dict, List, Optional
 from peft import LoraConfig, get_peft_model
 
 
-def create_tda_lora(
+def create_lora(
     unet: nn.Module,
     target_modules: List[str],
-    base_rank: int = 8,
+    rank: int = 16,
     alpha: float = 16.0,
     rank_pattern: Optional[Dict[str, int]] = None,
     alpha_pattern: Optional[Dict[str, float]] = None,
 ):
-    """Create LoRA-adapted UNet with optional per-layer rank pattern."""
     config = LoraConfig(
-        r=base_rank,
+        r=rank,
         lora_alpha=alpha,
         target_modules=target_modules,
         lora_dropout=0.0,
@@ -36,62 +38,60 @@ def create_tda_lora(
     return unet
 
 
-class TimestepSampler:
-    """Timestep-aware sampling distribution for training.
+# =============================================
+# Core Innovation: Domain-Adaptive Min-SNR
+# =============================================
 
-    Key insight from T-LoRA: high-noise timesteps are more prone to overfitting.
-    We sample fewer high-noise timesteps and more mid/low-noise timesteps.
+def compute_snr(noise_scheduler, timesteps):
+    """Compute signal-to-noise ratio for given timesteps."""
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+    sqrt_alpha = alphas_cumprod[timesteps] ** 0.5
+    sqrt_one_minus_alpha = (1 - alphas_cumprod[timesteps]) ** 0.5
+    snr = (sqrt_alpha / sqrt_one_minus_alpha) ** 2
+    return snr
+
+
+def compute_min_snr_weights(noise_scheduler, timesteps, gamma=5.0):
+    """Min-SNR-gamma loss weighting (ICCV 2023)."""
+    snr = compute_snr(noise_scheduler, timesteps)
+    snr_clipped = torch.clamp(snr, max=gamma)
+    weights = snr_clipped / snr
+    return weights
+
+
+def compute_adaptive_snr_weights(noise_scheduler, timesteps, gamma, domain_gap, domain_boost=1.0):
     """
+    Domain-Adaptive SNR weighting (our contribution).
 
-    def __init__(
-        self,
-        num_timesteps: int = 1000,
-        strategy: str = "tda",  # "uniform", "tda", "mid_focus"
-        domain_gap: float = 0.0,
-    ):
-        self.num_timesteps = num_timesteps
-        self.strategy = strategy
-        self.domain_gap = domain_gap
-        self.weights = self._build_weights()
+    For high domain gap: boost mid-range timestep weights (where domain
+    structure is learned) and reduce high-noise weights more aggressively.
+    """
+    snr = compute_snr(noise_scheduler, timesteps)
 
-    def _build_weights(self) -> torch.Tensor:
-        t = torch.linspace(0, 1, self.num_timesteps)
+    # Adaptive gamma: higher domain gap -> lower gamma -> less high-noise influence
+    adaptive_gamma = gamma * (1.0 - 0.4 * domain_gap)
+    adaptive_gamma = max(1.0, adaptive_gamma)
 
-        if self.strategy == "uniform":
-            w = torch.ones(self.num_timesteps)
+    snr_clipped = torch.clamp(snr, max=adaptive_gamma)
+    weights = snr_clipped / snr
 
-        elif self.strategy == "tda":
-            # Base: reduce high-noise timestep probability
-            # Higher domain gap -> more conservative (less high-noise sampling)
-            high_noise_scale = max(0.2, 1.0 - self.domain_gap * 0.8)
-            w = torch.where(t > 0.66, high_noise_scale, torch.ones_like(t))
-            w = torch.where(t < 0.33, torch.ones_like(t) * 1.2, w)  # boost low-noise
-            # Mid-range gets slight boost
-            mid_mask = (t >= 0.33) & (t <= 0.66)
-            w[mid_mask] = 1.5
+    # Domain boost: extra weight for mid-range timesteps when domain gap is large
+    if domain_boost > 0 and domain_gap > 0.1:
+        alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+        t_normalized = alphas_cumprod[timesteps]
+        # Gaussian centered at mid-range (alpha_cumprod ~= 0.5)
+        mid_boost = torch.exp(-((t_normalized - 0.5) ** 2) / (2 * 0.15 ** 2))
+        boost_factor = 1.0 + domain_boost * domain_gap * mid_boost
+        weights = weights * boost_factor
 
-        elif self.strategy == "mid_focus":
-            # Only mid-range boost, no domain awareness
-            w = torch.ones(self.num_timesteps)
-            mid_mask = (t >= 0.25) & (t <= 0.75)
-            w[mid_mask] = 2.0
-
-        else:
-            w = torch.ones(self.num_timesteps)
-
-        w = w / w.sum()
-        return w
-
-    def sample(self, batch_size: int, device: str = "cuda") -> torch.Tensor:
-        indices = torch.multinomial(self.weights, batch_size, replacement=True)
-        return indices.to(device)
+    return weights
 
 
-def compute_domain_gap(
-    target_image_paths: list,
-    pretrained_model_id: str,
-    device: str = "cuda",
-) -> float:
+# =============================================
+# Domain Gap Estimation
+# =============================================
+
+def compute_domain_gap(target_image_paths: list, device: str = "cuda") -> float:
     """Estimate domain gap using CLIP features."""
     import open_clip
     from PIL import Image
@@ -109,10 +109,8 @@ def compute_domain_gap(
         img_features = F.normalize(img_features, dim=-1)
         target_centroid = img_features.mean(dim=0)
 
-    ref_prompts = [
-        "a photo", "a natural image", "a picture of an object",
-        "a photograph", "a realistic image",
-    ]
+    ref_prompts = ["a photo", "a natural image", "a picture of an object",
+                   "a photograph", "a realistic image"]
     tokens = tokenizer(ref_prompts).to(device)
     with torch.no_grad():
         text_features = model.encode_text(tokens)
@@ -131,28 +129,26 @@ def compute_domain_gap(
     return gap
 
 
+# =============================================
+# Layer Importance (for rank pattern)
+# =============================================
+
 def compute_layer_importance(
-    unet,
-    dataloader,
-    noise_scheduler,
-    text_encoder,
-    vae,
-    tokenizer,
-    warmup_steps: int = 50,
-    device: str = "cuda",
+    unet, dataloader, noise_scheduler, text_encoder, vae, tokenizer,
+    warmup_steps: int = 30, device: str = "cuda",
 ) -> Dict[str, float]:
-    """Gradient-guided layer importance via short warmup training."""
-    print(f"Computing layer importance ({warmup_steps} warmup steps)...")
+    """Quick gradient-guided layer importance estimation."""
+    print(f"Computing layer importance ({warmup_steps} steps)...")
 
     grad_norms = {}
     for name, param in unet.named_parameters():
         if "lora_A" in name and param.requires_grad:
-            grad_norms[name.replace(".lora_A.default.weight", "")] = 0.0
+            key = name.replace(".lora_A.default.weight", "")
+            grad_norms[key] = 0.0
 
     optimizer = torch.optim.AdamW(
         [p for p in unet.parameters() if p.requires_grad], lr=1e-4
     )
-
     unet.train()
     data_iter = iter(dataloader)
 
@@ -173,15 +169,15 @@ def compute_layer_importance(
                 max_length=tokenizer.model_max_length, truncation=True,
                 return_tensors="pt",
             ).input_ids.to(device)
-            encoder_hidden_states = text_encoder(tokens)[0]
+            enc_hidden = text_encoder(tokens)[0]
 
         noise = torch.randn_like(latents)
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
-                                  (latents.shape[0],), device=device).long()
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        t = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                          (latents.shape[0],), device=device).long()
+        noisy = noise_scheduler.add_noise(latents, noise, t)
 
-        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+        pred = unet(noisy, t, enc_hidden).sample
+        loss = F.mse_loss(pred.float(), noise.float())
         loss.backward()
 
         for name, param in unet.named_parameters():
@@ -193,41 +189,32 @@ def compute_layer_importance(
         optimizer.step()
         optimizer.zero_grad()
 
-    # Normalize
     max_norm = max(grad_norms.values()) if grad_norms else 1.0
     importance = {k: v / max_norm for k, v in grad_norms.items()}
-
-    for k, v in sorted(importance.items(), key=lambda x: x[1], reverse=True):
-        print(f"  {k}: {v:.3f}")
-
     return importance
 
 
 def build_rank_pattern(
     importance: Dict[str, float],
     base_rank: int,
-    domain_gap: float,
-    domain_scale_factor: float = 0.3,
     top_k_ratio: float = 0.5,
-) -> Dict[str, int]:
-    """Convert layer importance + domain gap into per-layer rank pattern."""
-    # Domain-adjusted base rank
-    effective_base = max(2, int(base_rank * (1 - domain_scale_factor * domain_gap)))
-    print(f"Domain gap {domain_gap:.3f} -> effective base rank: {effective_base}")
-
+) -> tuple:
+    """Assign higher rank to important layers, lower to unimportant ones."""
     sorted_layers = sorted(importance.items(), key=lambda x: x[1], reverse=True)
-    top_k = int(len(sorted_layers) * top_k_ratio)
+    top_k = max(1, int(len(sorted_layers) * top_k_ratio))
 
     rank_pattern = {}
     alpha_pattern = {}
+    boosted = 0
     for i, (name, imp) in enumerate(sorted_layers):
         if i < top_k:
-            rank = min(effective_base * 2, 16)  # important layers get 2x rank
+            r = min(base_rank + 8, 32)  # boost by 8, cap at 32
+            boosted += 1
         else:
-            rank = max(2, effective_base // 2)   # less important layers get 0.5x rank
-        rank_pattern[name] = rank
-        alpha_pattern[name] = float(rank * 2)  # keep alpha/rank ratio = 2
+            r = max(4, base_rank - 4)  # reduce by 4, floor at 4
+        rank_pattern[name] = r
+        alpha_pattern[name] = float(r)
 
-    print(f"Rank pattern: {len([r for r in rank_pattern.values() if r > effective_base])} layers boosted, "
-          f"{len([r for r in rank_pattern.values() if r <= effective_base])} layers reduced")
+    print(f"Rank pattern: {boosted} layers boosted to {min(base_rank+8, 32)}, "
+          f"{len(sorted_layers)-boosted} layers reduced to {max(4, base_rank-4)}")
     return rank_pattern, alpha_pattern

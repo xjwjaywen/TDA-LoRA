@@ -1,4 +1,4 @@
-"""Main training script for TDA-LoRA."""
+"""Main training script for AdaSNR-LoRA."""
 import argparse
 import yaml
 import torch
@@ -10,7 +10,8 @@ from diffusers import StableDiffusionPipeline, DDPMScheduler, AutoencoderKL, UNe
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from src.tda_lora import (
-    create_tda_lora, TimestepSampler, compute_domain_gap,
+    create_lora, compute_domain_gap,
+    compute_min_snr_weights, compute_adaptive_snr_weights,
     compute_layer_importance, build_rank_pattern,
 )
 from src.dataset import FewShotDataset, DATASET_LOADERS
@@ -24,10 +25,10 @@ def main():
     parser.add_argument("--num_shots", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--method", type=str, default="tda_lora",
-                        choices=["tda_lora", "lora_only", "timestep_only",
-                                 "domain_only", "layer_only", "td_no_layer",
-                                 "tl_no_domain", "dl_no_timestep"])
+    parser.add_argument("--method", type=str, default="adasnr_lora",
+                        choices=["adasnr_lora", "lora_only", "minsnr_lora",
+                                 "adasnr_no_layer", "layer_only_minsnr",
+                                 "no_snr_layer_only"])
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -48,7 +49,6 @@ def main():
     method = args.method
     model_id = config["model"]["pretrained_model"]
     lora_cfg = config["lora"]
-    tda_cfg = config["tda"]
     train_cfg = config["training"]
 
     config["output"]["output_dir"] = f"./outputs/{dataset_name}/{class_name}/{method}_shot{num_shots}"
@@ -56,7 +56,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"TDA-LoRA | method={method} | {dataset_name}/{class_name} | {num_shots}-shot")
+    print(f"AdaSNR-LoRA | method={method} | {dataset_name}/{class_name} | {num_shots}-shot")
     print(f"{'='*60}")
 
     # --- Load data ---
@@ -86,58 +86,50 @@ def main():
     text_encoder.requires_grad_(False)
     vae.requires_grad_(False)
 
-    # --- Determine components based on method ---
-    use_timestep = method in ("tda_lora", "timestep_only", "td_no_layer", "tl_no_domain")
-    use_domain = method in ("tda_lora", "domain_only", "td_no_layer", "dl_no_timestep")
-    use_layer = method in ("tda_lora", "layer_only", "tl_no_domain", "dl_no_timestep")
+    # --- Determine which components to use ---
+    use_snr = method in ("adasnr_lora", "minsnr_lora", "adasnr_no_layer", "layer_only_minsnr")
+    use_adaptive = method in ("adasnr_lora", "adasnr_no_layer")
+    use_layer = method in ("adasnr_lora", "layer_only_minsnr", "no_snr_layer_only")
 
     # --- Domain gap ---
-    domain_gap = compute_domain_gap(real_paths, model_id, args.device) if use_domain else 0.0
+    domain_gap = 0.0
+    if use_adaptive:
+        domain_gap = compute_domain_gap(real_paths, args.device)
 
-    # --- Layer importance (requires initial LoRA for warmup) ---
+    # --- Layer importance & rank pattern ---
     rank_pattern = {}
     alpha_pattern = {}
     if use_layer:
-        # Create temporary LoRA for warmup
-        temp_unet = create_tda_lora(unet, lora_cfg["target_modules"],
-                                     base_rank=lora_cfg["base_rank"], alpha=lora_cfg["alpha"])
+        temp_unet = create_lora(unet, lora_cfg["target_modules"],
+                                 rank=lora_cfg["base_rank"], alpha=float(lora_cfg["base_rank"]))
         importance = compute_layer_importance(
             temp_unet, dataloader, noise_scheduler, text_encoder, vae, tokenizer,
-            warmup_steps=tda_cfg["warmup_steps"], device=args.device,
+            warmup_steps=30, device=args.device,
         )
-        # Remove temp LoRA
         temp_unet = temp_unet.unload()
-
         rank_pattern, alpha_pattern = build_rank_pattern(
-            importance, lora_cfg["base_rank"], domain_gap,
-            tda_cfg["domain_scale_factor"], tda_cfg["layer_importance_top_k"],
+            importance, lora_cfg["base_rank"], top_k_ratio=0.5
         )
-    elif use_domain:
-        # Domain-only: uniform rank adjusted by domain gap
-        effective_rank = max(2, int(lora_cfg["base_rank"] * (1 - tda_cfg["domain_scale_factor"] * domain_gap)))
-        print(f"Domain-only: all layers rank={effective_rank}")
-        # rank_pattern stays empty, just adjust base_rank
-        lora_cfg["base_rank"] = effective_rank
 
-    # --- Create final LoRA ---
-    unet = create_tda_lora(unet, lora_cfg["target_modules"],
-                            base_rank=lora_cfg["base_rank"], alpha=lora_cfg["alpha"],
-                            rank_pattern=rank_pattern, alpha_pattern=alpha_pattern)
-
-    # --- Timestep sampler ---
-    ts_sampler = TimestepSampler(
-        num_timesteps=noise_scheduler.config.num_train_timesteps,
-        strategy="tda" if use_timestep else "uniform",
-        domain_gap=domain_gap,
+    # --- Create LoRA ---
+    unet = create_lora(
+        unet, lora_cfg["target_modules"],
+        rank=lora_cfg["base_rank"], alpha=float(lora_cfg["base_rank"]),
+        rank_pattern=rank_pattern, alpha_pattern=alpha_pattern,
     )
-    print(f"Timestep strategy: {'tda' if use_timestep else 'uniform'}")
 
-    # --- Training ---
+    # --- SNR gamma ---
+    snr_gamma = config.get("snr", {}).get("gamma", 5.0)
+    domain_boost = config.get("snr", {}).get("domain_boost", 1.0)
+
+    # --- Optimizer ---
     optimizer = torch.optim.AdamW(
         [p for p in unet.parameters() if p.requires_grad],
         lr=train_cfg["learning_rate"],
+        weight_decay=0.01,
     )
 
+    # --- Training loop ---
     unet.train()
     data_iter = iter(dataloader)
     progress = tqdm(range(train_cfg["num_steps"]), desc=f"Training {method}")
@@ -163,11 +155,30 @@ def main():
             encoder_hidden_states = text_encoder(tokens)[0]
 
         noise = torch.randn_like(latents)
-        timesteps = ts_sampler.sample(latents.shape[0], args.device)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                                  (latents.shape[0],), device=args.device).long()
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
         noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+        # Per-sample MSE loss
+        loss_per_sample = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+        loss_per_sample = loss_per_sample.mean(dim=[1, 2, 3])
+
+        # Apply SNR weighting
+        if use_snr:
+            if use_adaptive:
+                snr_weights = compute_adaptive_snr_weights(
+                    noise_scheduler, timesteps, snr_gamma, domain_gap, domain_boost
+                )
+            else:
+                snr_weights = compute_min_snr_weights(
+                    noise_scheduler, timesteps, snr_gamma
+                )
+            loss = (loss_per_sample * snr_weights).mean()
+        else:
+            loss = loss_per_sample.mean()
+
         loss = loss / train_cfg["gradient_accumulation"]
         loss.backward()
 
@@ -190,7 +201,6 @@ def main():
 
     final_path = output_dir / "final"
     unet.save_pretrained(str(final_path))
-    print(f"Model saved to {final_path}")
 
     # --- Generate & Evaluate ---
     print("\nGenerating evaluation images...")
@@ -221,13 +231,14 @@ def main():
     results = evaluator.evaluate_all(images, real_paths, prompt)
 
     with open(output_dir / "metrics.txt", "w") as f:
-        f.write(f"method: {method}\ndataset: {dataset_name}/{class_name}\nnum_shots: {num_shots}\n")
-        f.write(f"domain_gap: {domain_gap:.4f}\n")
-        f.write(f"use_timestep: {use_timestep}\nuse_domain: {use_domain}\nuse_layer: {use_layer}\n")
+        f.write(f"method: {method}\ndataset: {dataset_name}/{class_name}\n")
+        f.write(f"num_shots: {num_shots}\ndomain_gap: {domain_gap:.4f}\n")
+        f.write(f"snr_gamma: {snr_gamma}\nuse_snr: {use_snr}\n")
+        f.write(f"use_adaptive: {use_adaptive}\nuse_layer: {use_layer}\n")
         for k, v in results.items():
             f.write(f"{k}: {v:.6f}\n")
 
-    print(f"\nResults saved to {output_dir / 'metrics.txt'}")
+    print(f"Results saved to {output_dir / 'metrics.txt'}")
 
 
 if __name__ == "__main__":
