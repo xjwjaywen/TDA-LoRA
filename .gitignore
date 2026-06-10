@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+wandb/
+outputs/
+data/
+models/
+checkpoints/
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+.DS_Store
+*.log
